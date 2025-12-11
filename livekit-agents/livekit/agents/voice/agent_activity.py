@@ -135,6 +135,7 @@ class AgentActivity(RecognitionHooks):
         self._speech_tasks: list[asyncio.Task[Any]] = []
 
         self._preemptive_generation: _PreemptiveGeneration | None = None
+        self._generation_in_progress: bool = False  # Guard to prevent duplicate LLM generation
 
         self._drain_blocked_tasks: list[asyncio.Task[Any]] = []
         self._mcp_tools: list[mcp.MCPTool] = []
@@ -922,6 +923,7 @@ class AgentActivity(RecognitionHooks):
         if self._preemptive_generation is not None:
             self._preemptive_generation.speech_handle._cancel()
             self._preemptive_generation = None
+            self._generation_in_progress = False
 
     def _interrupt_background_speeches(self, force: bool = False) -> list[SpeechHandle]:
         interrupted_speeches: list[SpeechHandle] = []
@@ -1312,10 +1314,12 @@ class AgentActivity(RecognitionHooks):
             or self._scheduling_paused
             or (self._current_speech is not None and not self._current_speech.interrupted)
             or not isinstance(self.llm, llm.LLM)
+            or self._generation_in_progress  # Prevent duplicate generation
         ):
             return
 
         self._cancel_preemptive_generation()
+        self._generation_in_progress = True
 
         user_message = llm.ChatMessage(
             role="user",
@@ -1516,17 +1520,29 @@ class AgentActivity(RecognitionHooks):
                     "using preemptive generation",
                     extra={"preemptive_lead_time": time.time() - preemptive.created_at},
                 )
+                # Generation is already in progress from preemptive, mark it
+                self._generation_in_progress = True
             else:
                 logger.warning(
                     "preemptive generation enabled but chat context or tools have changed after `on_user_turn_completed`",  # noqa: E501
                 )
                 preemptive.speech_handle._cancel()
+                # Reset flag since we're cancelling and will start a new generation
+                self._generation_in_progress = False
 
             self._preemptive_generation = None
 
         if speech_handle is None:
+            # Guard against duplicate generation
+            if self._generation_in_progress:
+                logger.warning(
+                    "skipping duplicate LLM generation request, generation already in progress"
+                )
+                return
+            
             # Ensure the new message is passed to generate_reply
             # This preserves the original message_id, making it easier for users to track responses
+            self._generation_in_progress = True
             speech_handle = self._generate_reply(
                 user_message=user_message,
                 chat_ctx=temp_mutable_chat_ctx,
@@ -1564,6 +1580,8 @@ class AgentActivity(RecognitionHooks):
     # endregion
 
     def _on_pipeline_reply_done(self, _: asyncio.Task[None]) -> None:
+        # Reset generation flag when pipeline reply completes
+        self._generation_in_progress = False
         if not self._speech_q and (not self._current_speech or self._current_speech.done()):
             self._session._update_agent_state("listening")
 
